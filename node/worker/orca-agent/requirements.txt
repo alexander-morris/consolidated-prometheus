@@ -19,3 +19,7 @@ colorama>=0.4.6
 pymongo>=4.11.0
 PyNaCl>=1.5.0
 setuptools>=78.1.0
+
+# Add local SDK for development
+# For Docker, this would ideally be copied in and installed, or installed from a package registry.
+-e ../../../../task_sdk/python/

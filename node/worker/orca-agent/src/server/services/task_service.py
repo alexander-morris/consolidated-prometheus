@@ -13,8 +13,19 @@ from src.workflows.task.prompts import PROMPTS as TASK_PROMPTS
 
 from dotenv import load_dotenv
 import time
+import traceback
+
+from orca_task_sdk.client import OrcaTaskClient
 
 load_dotenv()
+
+
+def get_sdk_client(contextual_task_id: str = None) -> OrcaTaskClient:
+    """ Helper to get an SDK client instance. 
+        ORCA_TASK_ID from env is used by default by OrcaTaskClient if task_id is None.
+        If this service handles multiple task_ids, pass the specific one here.
+    """
+    return OrcaTaskClient(task_id=contextual_task_id)
 
 
 def complete_todo(
@@ -27,16 +38,20 @@ def complete_todo(
     **kwargs,
 ):
     """Handle task creation request."""
+    sdk_client = get_sdk_client(task_id)
+    sdk_client.send_status_update(f"complete_todo started for task: {task_id}, round: {round_number}", progress=0)
     try:
         # Proceed with todo request
         todo_result = get_task_details(
             staking_signature, staking_key, pub_key, "worker"
         )
         if not todo_result.get("success", False):
+            error_msg = todo_result.get("error", "Unknown error fetching todo")
+            sdk_client.send_task_error(f"Failed to fetch todo: {error_msg}", error_details=todo_result)
             return {
                 "success": False,
                 "status": todo_result.get("status", 500),
-                "error": todo_result.get("error", "Unknown error fetching todo"),
+                "error": error_msg,
             }
         todo = todo_result["data"]
 
@@ -57,6 +72,7 @@ def complete_todo(
                 f"Missing required fields in todo data. "
                 f"repo_owner={repo_owner}, repo_name={repo_name}, branch={base_branch}"
             )
+            sdk_client.send_task_error(error_msg, error_details=todo)
             return {
                 "success": False,
                 "status": 400,
@@ -72,6 +88,7 @@ def complete_todo(
             logger.info(f"Found target repo: {target_repo.html_url}")
         except Exception as e:
             logger.error(f"Failed to find repository {repo_url}: {str(e)}")
+            sdk_client.send_task_error(f"Failed to find repository {repo_url}: {str(e)}", error_details={"repo_url": repo_url})
             return {
                 "success": False,
                 "status": 404,
@@ -93,6 +110,7 @@ def complete_todo(
                 f"Base branch '{base_branch}' does not exist in repository "
                 f"{repo_owner}/{repo_name} ({target_repo.html_url}): {str(e)}"
             )
+            sdk_client.send_task_error(error_msg, error_details={"base_branch": base_branch, "repo_url": target_repo.html_url})
             return {
                 "success": False,
                 "status": 400,
@@ -114,8 +132,10 @@ def complete_todo(
             )
 
             if not result.get("success", False):
+                sdk_client.send_task_error("run_todo_task failed within complete_todo", error_details=result)
                 return result
 
+            sdk_client.send_status_update(f"PR successfully created: {result['data']['pr_url']}", progress=100)
             return {
                 "success": True,
                 "data": {
@@ -124,17 +144,24 @@ def complete_todo(
                 },
             }
         except Exception as e:
+            detailed_error = traceback.format_exc()
+            sdk_client.send_task_error(f"Error in complete_todo main logic: {str(e)}", stack_trace=detailed_error)
+            log_error(e, context=f"Critical error in complete_todo for task {task_id}")
             return {"success": False, "status": 500, "error": str(e)}
     except Exception as e:
+        detailed_error = traceback.format_exc()
+        sdk_client.send_task_error(f"Critical error in complete_todo: {str(e)}", stack_trace=detailed_error)
+        log_error(e, context=f"Critical error in complete_todo for task {task_id}")
         return {
             "success": False,
             "status": 500,
-            "error": f"Failed to check base branch: {str(e)}",
+            "error": f"Failed to complete todo: {str(e)}",
         }
 
 
 def get_task_details(signature, staking_key, pub_key, task_type):
     """Get task details from middle server."""
+    sdk_client = get_sdk_client("get_task_details_unknown_task")
 
     tasks_urls = {
         "worker": "/api/builder/fetch-to-do",
@@ -142,6 +169,7 @@ def get_task_details(signature, staking_key, pub_key, task_type):
     }
     try:
         logger.info(f"Fetching {task_type} task")
+        sdk_client.send_status_update(f"Fetching {task_type} task details from middle server")
 
         response = requests.post(
             os.environ["MIDDLE_SERVER_URL"] + tasks_urls[task_type],
@@ -157,16 +185,21 @@ def get_task_details(signature, staking_key, pub_key, task_type):
         logger.info(f"Fetch response: {result}")
 
         if not result.get("success", False):
+            error_msg = result.get("message", "Unknown error from middle server")
+            sdk_client.send_task_error(f"Middle server fetch {task_type} failed: {error_msg}", error_details=result)
             return {
                 "success": False,
                 "status": 400,
-                "error": result.get("message", "Unknown error from middle server"),
+                "error": error_msg,
             }
 
+        sdk_client.send_status_update(f"Successfully fetched {task_type} task details")
         return {"success": True, "data": result.get("data", {})}
 
     except requests.exceptions.RequestException as e:
+        error_message_for_sdk = f"RequestException while fetching {task_type} task details: {str(e)}"
         if not hasattr(e, "response") or e.response is None:
+            sdk_client.send_task_error(error_message_for_sdk, error_details={"response_text": "No response from middle server", "status_code": None})
             return {
                 "success": False,
                 "status": 500,
@@ -176,14 +209,15 @@ def get_task_details(signature, staking_key, pub_key, task_type):
         # Parse the JSON error response
         try:
             error_data = e.response.json()
-            error_message = error_data.get("message", "Unknown error")
+            parsed_error_message = error_data.get("message", "Unknown error")
         except ValueError:
-            error_message = e.response.text
+            parsed_error_message = e.response.text
 
+        sdk_client.send_task_error(error_message_for_sdk, error_details={"response_text": parsed_error_message, "status_code": e.response.status_code if hasattr(e, 'response') else None})
         return {
             "success": False,
             "status": e.response.status_code,
-            "error": error_message,  # Use parsed message instead of raw JSON
+            "error": parsed_error_message,
         }
 
 
@@ -200,6 +234,8 @@ def run_todo_task(
     base_branch,
 ):
     """Run todo task and create PR."""
+    sdk_client = get_sdk_client(task_id)
+    sdk_client.send_status_update(f"run_todo_task started for {task_id}", progress=0)
     try:
         db = get_db()
 
@@ -216,6 +252,7 @@ def run_todo_task(
             logger.info(
                 f"Found existing PR URL for task {task_id}, round {round_number}"
             )
+            sdk_client.send_log_entry("info", f"Found existing PR URL for task {task_id}, round {round_number}")
             return {
                 "success": True,
                 "data": {
@@ -281,13 +318,17 @@ def run_todo_task(
             f"Stored PR URL {pr_url} locally for task {task_id}, round {round_number}"
         )
 
+        sdk_client.send_log_entry("info", f"Workflow created PR: {pr_url}")
+        sdk_client.send_status_update("PR URL stored locally", progress=90)
         return {
             "success": True,
             "data": {"pr_url": pr_url, "message": "Created new PR"},
         }
 
     except Exception as e:
-        log_error(e, context="PR creation failed")
+        detailed_error = traceback.format_exc()
+        sdk_client.send_task_error(f"Error in run_todo_task for {task_id}: {str(e)}", stack_trace=detailed_error)
+        log_error(e, context=f"PR creation failed in run_todo_task for {task_id}")
         if "db" in locals():
             # Update submission status
             submission = (
@@ -312,6 +353,8 @@ def _check_existing_pr(round_number: int, task_id: str) -> dict:
 
     Returns the PR URL if found, but doesn't prevent remote recording.
     """
+    sdk_client = get_sdk_client(task_id)
+    sdk_client.send_log_entry("info", f"Checking existing PR for task {task_id}, round {round_number}")
     try:
         db = get_db()
         submission = (
@@ -328,6 +371,7 @@ def _check_existing_pr(round_number: int, task_id: str) -> dict:
             logger.info(
                 f"Local PR record found for task {task_id}, round {round_number}"
             )
+            sdk_client.send_log_entry("info", f"Local PR record found: {submission.pr_url}")
             return {
                 "success": True,
                 "data": {
@@ -336,8 +380,11 @@ def _check_existing_pr(round_number: int, task_id: str) -> dict:
                 },
                 "skip_local_recording": True,  # Flag to skip local recording but still do remote
             }
+        sdk_client.send_log_entry("info", f"No existing completed PR record found locally.")
         return {"success": False}
     except Exception as e:
+        detailed_error = traceback.format_exc()
+        sdk_client.send_task_error(f"Failed to check existing PR: {str(e)}", stack_trace=detailed_error)
         log_error(e, "Failed to check existing PR")
         return {"success": False, "status": 500, "error": str(e)}
 
@@ -363,6 +410,8 @@ def _store_pr_remotely(
     For worker tasks, the uuid must be included as todo_uuid.
     If uuid is not provided, will attempt to get it from the database using task_id and round_number.
     """
+    sdk_client = get_sdk_client(task_id)
+    sdk_client.send_status_update(f"Attempting to record PR remotely for {node_type} task", progress=0)
     try:
         # Determine the endpoint based on node type
         endpoint = (
@@ -394,8 +443,10 @@ def _store_pr_remotely(
                 if submission and submission.uuid:
                     uuid = submission.uuid
                     logger.info(f"Retrieved uuid={uuid} from database")
+                    sdk_client.send_log_entry("info", f"Retrieved uuid={uuid} from database")
             except Exception as e:
                 logger.warning(f"Failed to get uuid from database: {str(e)}")
+                sdk_client.send_task_error(f"Failed to get uuid from database: {str(e)}", error_details={"task_id": task_id, "round_number": round_number})
 
         if uuid:
             if node_type == "leader":
@@ -405,15 +456,19 @@ def _store_pr_remotely(
             logger.info(
                 f"Added {'issueUuid' if node_type == 'leader' else 'todo_uuid'}={uuid} to payload"
             )
+            sdk_client.send_log_entry("info", f"Added {'issueUuid' if node_type == 'leader' else 'todo_uuid'}={uuid} to payload")
         else:
             logger.warning(f"No uuid available for {node_type} PR recording")
+            sdk_client.send_log_entry("warning", f"No uuid available for {node_type} PR recording")
 
         # Add github_username to the payload if provided
         if github_username:
             payload["githubUsername"] = github_username
             logger.info(f"Including GitHub username in payload: {github_username}")
+            sdk_client.send_log_entry("info", f"Including GitHub username in payload: {github_username}")
 
         logger.info(f"Sending payload to {endpoint}: {payload}")
+        sdk_client.send_log_entry("info", f"Sending payload to {endpoint}: {payload}")
         response = requests.post(
             os.environ["MIDDLE_SERVER_URL"] + endpoint,
             json=payload,
@@ -425,12 +480,15 @@ def _store_pr_remotely(
             "data": {"message": "PR recorded remotely", "pr_url": pr_url},
         }
     except requests.exceptions.RequestException as e:
+        error_message_for_sdk = f"RequestException while recording PR remotely: {str(e)}"
         if not hasattr(e, "response"):
+            sdk_client.send_task_error(error_message_for_sdk, error_details={"response_text": "No response from middle server", "status_code": None})
             return {
                 "success": False,
                 "status": 500,
                 "error": "No response from middle server",
             }
+        sdk_client.send_task_error(error_message_for_sdk, error_details={"response_text": e.response.text, "status_code": e.response.status_code})
         return {
             "success": False,
             "status": e.response.status_code,
@@ -447,6 +505,8 @@ def _store_pr_locally(
     github_username: str = None,
 ) -> dict:
     """Store PR URL in local database."""
+    sdk_client = get_sdk_client(task_id)
+    sdk_client.send_status_update(f"Attempting to record PR locally for {node_type} task", progress=0)
     try:
         db = get_db()
         username = os.environ["GITHUB_USERNAME"]
@@ -477,18 +537,18 @@ def _store_pr_locally(
 
             db.commit()
             logger.info("Local database updated successfully")
+            sdk_client.send_log_entry("info", "Local database updated successfully")
             return {
                 "success": True,
                 "data": {"message": "PR recorded locally", "pr_url": pr_url},
             }
         else:
             error_msg = f"No submission found for task {task_id}, round {round_number}"
-            log_error(
-                Exception("Submission not found"),
-                context=error_msg,
-            )
+            sdk_client.send_task_error(Exception(error_msg), context=error_msg)
             return {"success": False, "status": 409, "error": error_msg}
     except Exception as e:
+        detailed_error = traceback.format_exc()
+        sdk_client.send_task_error(f"Failed to store PR locally: {str(e)}", stack_trace=detailed_error)
         log_error(e, "Failed to store PR locally")
         return {"success": False, "status": 500, "error": str(e)}
 
@@ -541,8 +601,12 @@ def record_pr(
         if submission and submission.uuid:
             uuid = submission.uuid
             logger.info(f"Found uuid={uuid} in database")
+            sdk_client = get_sdk_client(task_id)
+            sdk_client.send_log_entry("info", f"Found uuid={uuid} in database")
     except Exception as e:
         logger.warning(f"Error retrieving uuid from database: {str(e)}")
+        sdk_client = get_sdk_client(task_id)
+        sdk_client.send_task_error(f"Error retrieving uuid from database: {str(e)}", error_details={"task_id": task_id, "round_number": round_number})
 
     # If we couldn't find the UUID in the database and this is a leader task, try getting it from task details
     if not uuid and node_type == "leader":
@@ -554,6 +618,8 @@ def record_pr(
             uuid = task_details["data"].get("issue_uuid")
             if not uuid:
                 logger.warning("No issue_uuid found in task details for leader task")
+                sdk_client = get_sdk_client(task_id)
+                sdk_client.send_log_entry("warning", "No issue_uuid found in task details for leader task")
 
     # If we're processing a worker task and couldn't find the UUID, try to get it from task details
     if not uuid and node_type == "worker":
@@ -565,6 +631,8 @@ def record_pr(
             uuid = task_details["data"].get("todo_uuid")
             if not uuid:
                 logger.warning("No todo_uuid found in task details for worker task")
+                sdk_client = get_sdk_client(task_id)
+                sdk_client.send_log_entry("warning", "No todo_uuid found in task details for worker task")
 
     # Step 1: Always attempt to record with middle server, even for existing PRs
     remote_result = _store_pr_remotely(
@@ -581,8 +649,12 @@ def record_pr(
         # If the error is because the PR is already recorded, treat it as a success
         if "already" in str(remote_result.get("error", "")).lower():
             logger.info("PR already recorded remotely, continuing")
+            sdk_client = get_sdk_client(task_id)
+            sdk_client.send_log_entry("info", "PR already recorded remotely, continuing")
         else:
             # For other errors, return the error
+            sdk_client = get_sdk_client(task_id)
+            sdk_client.send_task_error("run_todo_task failed within complete_todo", error_details=remote_result)
             return remote_result
 
     # Step 2: Record locally if not already recorded
@@ -610,13 +682,22 @@ def record_pr(
                     logger.info(
                         f"Updated submission with uuid={uuid}, node_type={node_type}"
                     )
+                    sdk_client = get_sdk_client(task_id)
+                    sdk_client.send_log_entry("info", f"Updated submission with uuid={uuid}, node_type={node_type}")
             except Exception as e:
                 logger.warning(f"Failed to update existing submission: {str(e)}")
+                sdk_client = get_sdk_client(task_id)
+                sdk_client.send_task_error(f"Failed to update existing submission: {str(e)}", error_details={"round_number": round_number, "task_id": task_id})
     else:
         local_result = _store_pr_locally(round_number, pr_url, task_id, uuid, node_type)
         if not local_result["success"]:
+            sdk_client = get_sdk_client(task_id)
+            sdk_client.send_task_error("run_todo_task failed within complete_todo", error_details=local_result)
             return local_result
 
+    sdk_client = get_sdk_client(task_id)
+    sdk_client.send_log_entry("info", "PR recorded successfully")
+    sdk_client.send_status_update(f"PR successfully created: {pr_url}", progress=100)
     return {
         "success": True,
         "data": {"message": "PR recorded successfully", "pr_url": pr_url},
@@ -627,6 +708,8 @@ def consolidate_prs(
     task_id, round_number, staking_key, pub_key, staking_signature, public_signature
 ):
     """Consolidate PRs from workers."""
+    sdk_client = get_sdk_client(task_id)
+    sdk_client.send_status_update(f"consolidate_prs started for task: {task_id}, round: {round_number}", progress=0)
     try:
         db = get_db()
 
@@ -646,6 +729,7 @@ def consolidate_prs(
             logger.info(
                 f"Found existing PR URL for task {task_id}, round {round_number}: {pr_url}"
             )
+            sdk_client.send_log_entry("info", f"Found existing PR URL for task {task_id}, round {round_number}: {pr_url}")
             # We'll use the existing PR URL
         else:
             # Get task details which includes issue_uuid
@@ -654,6 +738,7 @@ def consolidate_prs(
             )
 
             if not issue_result.get("success", False):
+                sdk_client.send_task_error("Failed to fetch todo", error_details=issue_result)
                 return {
                     "success": False,
                     "status": issue_result.get("status", 500),
@@ -699,6 +784,7 @@ def consolidate_prs(
             if not source_fork.fork:
                 submission.status = "failed"
                 db.commit()
+                sdk_client.send_task_error("Source repository is not a fork", error_details={"repo_url": f"{repo_owner}/{repo_name}"})
                 return {
                     "success": False,
                     "status": 400,
@@ -735,18 +821,23 @@ def consolidate_prs(
                 )
                 submission.status = "failed"
                 db.commit()
+                sdk_client.send_task_error("Merge workflow failed to create PR", error_details={"task_id": task_id})
                 return {
                     "success": False,
                     "status": 500,
                     "error": "Merge workflow failed to create PR",
                 }
 
+        sdk_client.send_log_entry("info", f"PRs consolidated successfully, PR URL: {pr_url}")
+        sdk_client.send_status_update(f"PRs consolidated successfully, PR URL: {pr_url}", progress=100)
         return {
             "success": True,
             "data": {"pr_url": pr_url, "message": "PRs consolidated successfully"},
         }
 
     except Exception as e:
+        detailed_error = traceback.format_exc()
+        sdk_client.send_task_error(f"Critical error in consolidate_prs: {str(e)}", stack_trace=detailed_error)
         log_error(e, context="PR consolidation failed")
         if "db" in locals():
             # Update submission status
@@ -780,6 +871,8 @@ def create_aggregator_repo(task_id):
             - data (dict): Contains fork_url and branch_name if successful
             - status (int): HTTP status code
     """
+    sdk_client = get_sdk_client(task_id)
+    sdk_client.send_status_update(f"create_aggregator_repo started for task: {task_id}", progress=0)
     try:
         # Initialize GitHub client with token
         github = Github(os.environ["GITHUB_TOKEN"])
@@ -792,6 +885,7 @@ def create_aggregator_repo(task_id):
 
         if not issue_data.get("success"):
             logger.error(f"assign_issue failed: {issue_data.get('error')}")
+            sdk_client.send_task_error(f"Failed to assign issue: {issue_data.get('error')}", error_details=issue_data)
             return {
                 "success": False,
                 "error": f"Failed to assign issue: {issue_data.get('error')}",
@@ -810,6 +904,7 @@ def create_aggregator_repo(task_id):
 
         if not issue_uuid or not repo_owner or not repo_name:
             logger.error("Missing required data in assign_issue response")
+            sdk_client.send_task_error("Missing required data (issueId, repoOwner, or repoName) from assign_issue", error_details={"issue_data": issue_data})
             return {
                 "success": False,
                 "error": "Missing required data (issueId, repoOwner, or repoName) from assign_issue",
@@ -825,6 +920,7 @@ def create_aggregator_repo(task_id):
             logger.error(
                 f"Error finding source repo {repo_owner}/{repo_name}: {str(e)}"
             )
+            sdk_client.send_task_error(f"Failed to find source repo {repo_owner}/{repo_name}: {str(e)}", error_details={"repo_url": f"{repo_owner}/{repo_name}"})
             return {
                 "success": False,
                 "error": f"Failed to find source repo {repo_owner}/{repo_name}: {str(e)}",
@@ -879,6 +975,8 @@ def create_aggregator_repo(task_id):
             # The create-aggregator-repo endpoint should only create the fork and branch
             # It should not call the middle server directly
 
+            sdk_client.send_log_entry("info", f"Successfully created aggregator repository, fork URL: {fork.html_url}, branch name: {branch_name}")
+            sdk_client.send_status_update(f"Successfully created aggregator repository, fork URL: {fork.html_url}, branch name: {branch_name}", progress=100)
             return {
                 "status": 200,
                 "success": True,
@@ -894,6 +992,7 @@ def create_aggregator_repo(task_id):
             logger.error(
                 f"Error in branch creation or aggregator info recording: {str(e)}"
             )
+            sdk_client.send_task_error(f"Failed to create branch or record aggregator info: {str(e)}", error_details={"task_id": task_id})
             return {
                 "success": False,
                 "error": f"Failed to create branch or record aggregator info: {str(e)}",
@@ -903,30 +1002,13 @@ def create_aggregator_repo(task_id):
 
     except Exception as e:
         logger.error(f"Error in create_aggregator_repo: {str(e)}")
+        sdk_client.send_task_error(f"Failed to create aggregator repository: {str(e)}", error_details={"task_id": task_id})
         return {
             "success": False,
             "error": f"Failed to create aggregator repository: {str(e)}",
             "data": None,
             "status": 500,
         }
-
-
-# def fetch_source_repo(task_id):
-#     """Fetch the source repo for a given task."""
-#     try:
-#         response = requests.post(
-#             os.environ["MIDDLE_SERVER_URL"] + "/api/builder/source-repo",
-#             json={
-#                 "taskId": task_id,
-#             },
-#             headers={"Content-Type": "application/json"},
-#         )
-#         response.raise_for_status()
-#         return response.json()
-#     except requests.exceptions.RequestException as e:
-#         if not hasattr(e, "response"):
-#             return {"status": 500, "error": "No response from middle server"}
-#         return {"status": e.response.status_code, "error": e.response.text}
 
 
 def assign_issue(task_id):
@@ -954,6 +1036,8 @@ def assign_issue(task_id):
 
         if not result.get("success", False):
             logger.error(f"assign_issue failed: {result.get('message')}")
+            sdk_client = get_sdk_client(task_id)
+            sdk_client.send_task_error(f"assign_issue failed: {result.get('message')}", error_details=result)
             return {
                 "success": False,
                 "status": 400,
@@ -962,11 +1046,15 @@ def assign_issue(task_id):
 
         logger.info(f"assign_issue succeeded: {result}")
         # Return the entire result as data since it contains the issueId
+        sdk_client = get_sdk_client(task_id)
+        sdk_client.send_log_entry("info", "assign_issue succeeded")
         return {"success": True, "data": result}
 
     except requests.exceptions.RequestException as e:
         logger.error(f"Request exception in assign_issue: {str(e)}")
         if not hasattr(e, "response") or e.response is None:
+            sdk_client = get_sdk_client(task_id)
+            sdk_client.send_task_error("No response from middle server", error_details={"response_text": "No response from middle server", "status_code": None})
             return {
                 "success": False,
                 "status": 500,
@@ -977,9 +1065,13 @@ def assign_issue(task_id):
             error_data = e.response.json()
             error_message = error_data.get("message", "Unknown error")
             logger.error(f"Error response: {error_message}")
+            sdk_client = get_sdk_client(task_id)
+            sdk_client.send_task_error(f"Error response: {error_message}", error_details={"response_text": error_message, "status_code": e.response.status_code if hasattr(e, 'response') else None})
         except ValueError:
             error_message = e.response.text
             logger.error(f"Raw error response: {error_message}")
+            sdk_client = get_sdk_client(task_id)
+            sdk_client.send_task_error(f"Raw error response: {error_message}", error_details={"response_text": error_message, "status_code": e.response.status_code if hasattr(e, 'response') else None})
 
         return {
             "success": False,
@@ -1000,6 +1092,8 @@ def add_aggregator_info(task_id, staking_key, pub_key, signature):
     Returns:
         dict: The result of the operation with status code
     """
+    sdk_client = get_sdk_client(task_id)
+    sdk_client.send_status_update(f"Adding aggregator info for task {task_id}", progress=0)
     logger.info(f"Adding aggregator info for task {task_id}")
     try:
         payload = {
@@ -1019,6 +1113,7 @@ def add_aggregator_info(task_id, staking_key, pub_key, signature):
 
         if not result.get("success", False):
             logger.error(f"Failed to add aggregator info: {result.get('message')}")
+            sdk_client.send_task_error(f"Failed to add aggregator info: {result.get('message')}", error_details=result)
             return {
                 "success": False,
                 "error": f"Failed to add aggregator info: {result.get('message')}",
@@ -1026,6 +1121,7 @@ def add_aggregator_info(task_id, staking_key, pub_key, signature):
             }
 
         logger.info("Successfully added aggregator info")
+        sdk_client.send_log_entry("info", "Successfully added aggregator info")
         return {
             "success": True,
             "message": "Successfully added aggregator info",
@@ -1036,11 +1132,13 @@ def add_aggregator_info(task_id, staking_key, pub_key, signature):
     except requests.exceptions.RequestException as e:
         logger.error(f"Request exception in add_aggregator_info: {str(e)}")
         if not hasattr(e, "response") or e.response is None:
+            sdk_client.send_task_error("No response from middle server", error_details={"response_text": "No response from middle server", "status_code": None})
             return {
                 "success": False,
                 "error": "No response from middle server",
                 "status": 500,
             }
+        sdk_client.send_task_error(f"Request exception in add_aggregator_info: {str(e)}", error_details={"response_text": e.response.text, "status_code": e.response.status_code if hasattr(e, 'response') else None})
         return {
             "success": False,
             "error": e.response.text,
@@ -1048,6 +1146,7 @@ def add_aggregator_info(task_id, staking_key, pub_key, signature):
         }
     except Exception as e:
         logger.error(f"Error in add_aggregator_info: {str(e)}")
+        sdk_client.send_task_error(f"Error in add_aggregator_info: {str(e)}", error_details={"task_id": task_id})
         return {
             "success": False,
             "error": f"Failed to add aggregator info: {str(e)}",

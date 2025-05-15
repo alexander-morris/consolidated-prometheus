@@ -1,0 +1,26 @@
+{
+  "compilerOptions": {
+    "target": "es2020",
+    "module": "commonjs",
+    "outDir": "./dist_e2e_output",
+    "rootDir": "../../",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "moduleResolution": "node",
+    "resolveJsonModule": true,
+    "sourceMap": false
+  },
+  "include": [
+    "./test_task.ts",
+    "./mock_namespace.ts",
+    "../../task_sdk/typescript/src/**/*.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist_e2e_output",
+    "../../task_sdk/typescript/dist",
+    "../../task_sdk/typescript/tests"
+  ]
+} 

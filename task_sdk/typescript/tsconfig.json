@@ -1,0 +1,22 @@
+{
+  "compilerOptions": {
+    "target": "es2019", 
+    "module": "commonjs", 
+    "lib": ["es2019", "dom"],
+    "declaration": true,
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "moduleResolution": "node", 
+    // If using path aliases, add them here, e.g.:
+    // "baseUrl": "./src", 
+    // "paths": {
+    //   "@/*": ["*"]
+    // }
+  },
+  "include": ["src/**/*"], // Process all .ts files in the src directory
+  "exclude": ["node_modules", "dist", "tests"]
+} 

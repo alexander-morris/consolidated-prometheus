@@ -1,0 +1,36 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "OrcaToTaskMessage",
+  "type": "object",
+  "properties": {
+    "taskId": {
+      "type": "string",
+      "description": "The unique identifier of the Orca task instance sending the message."
+    },
+    "eventType": {
+      "type": "string",
+      "description": "The type of event being reported.",
+      "enum": [
+        "status_update",
+        "log_entry",
+        "task_result",
+        "task_error"
+      ]
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 timestamp of when the event occurred in the Orca agent."
+    },
+    "payload": {
+      "type": "object",
+      "description": "The actual data associated with the event. Structure depends on eventType."
+    }
+  },
+  "required": [
+    "taskId",
+    "eventType",
+    "timestamp",
+    "payload"
+  ]
+} 
